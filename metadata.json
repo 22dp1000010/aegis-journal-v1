@@ -1,0 +1,7 @@
+{
+  "name": "Aegis Journal",
+  "description": "A private financial reflection journal with server-side identifier redaction, owner-bound isolation, and reflective AI conversations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
