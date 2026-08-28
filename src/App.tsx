@@ -11,13 +11,14 @@ import { JournalEditor } from './components/JournalEditor';
 import { EntryListView } from './components/EntryListView';
 import { EntryDetailView } from './components/EntryDetailView';
 import { TrustCenter } from './components/TrustCenter';
+import { ActivityView } from './components/ActivityView';
 import { AliasManagerModal } from './components/AliasManagerModal';
 import { JournalEntry } from './types';
 import { Loader2 } from 'lucide-react';
 
 const MainContent: React.FC = () => {
   const { user, loading } = useAuth();
-  const [currentView, setCurrentView] = useState<'editor' | 'list' | 'detail' | 'trust'>('editor');
+  const [currentView, setCurrentView] = useState<'editor' | 'list' | 'detail' | 'trust' | 'activity'>('editor');
   const [selectedEntry, setSelectedEntry] = useState<JournalEntry | null>(null);
   const [isAliasModalOpen, setIsAliasModalOpen] = useState(false);
 
@@ -50,7 +51,7 @@ const MainContent: React.FC = () => {
     setCurrentView('detail');
   };
 
-  const handleNavigate = (view: 'editor' | 'list' | 'trust') => {
+  const handleNavigate = (view: 'editor' | 'list' | 'trust' | 'activity') => {
     setCurrentView(view);
     setSelectedEntry(null);
   };
@@ -87,6 +88,13 @@ const MainContent: React.FC = () => {
         )}
 
         {currentView === 'trust' && <TrustCenter />}
+
+        {currentView === 'activity' && (
+          <ActivityView
+            onNewReflection={() => setCurrentView('editor')}
+            onNavigateToTrust={() => setCurrentView('trust')}
+          />
+        )}
       </main>
 
       <AliasManagerModal

@@ -3,12 +3,12 @@
  */
 
 import React from 'react';
-import { Shield, BookOpen, PenLine, KeyRound, LogOut, User as UserIcon, Tag } from 'lucide-react';
+import { Shield, BookOpen, PenLine, KeyRound, LogOut, User as UserIcon, Tag, Activity } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 
 interface HeaderProps {
-  currentView: 'editor' | 'list' | 'detail' | 'trust';
-  onNavigate: (view: 'editor' | 'list' | 'trust') => void;
+  currentView: 'editor' | 'list' | 'detail' | 'trust' | 'activity';
+  onNavigate: (view: 'editor' | 'list' | 'trust' | 'activity') => void;
   onOpenAliasManager: () => void;
 }
 
@@ -72,6 +72,19 @@ export const Header: React.FC<HeaderProps> = ({ currentView, onNavigate, onOpenA
           >
             <BookOpen className="w-3.5 h-3.5" />
             <span>Past Reflections</span>
+          </button>
+
+          <button
+            id="nav-btn-activity"
+            onClick={() => onNavigate('activity')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs sm:text-sm font-medium rounded-lg transition-all ${
+              currentView === 'activity'
+                ? 'bg-white text-black shadow-xs'
+                : 'text-gray-400 hover:text-white hover:bg-[#1A1A1A]'
+            }`}
+          >
+            <Activity className="w-3.5 h-3.5" />
+            <span>Activity</span>
           </button>
 
           <button

@@ -64,3 +64,10 @@ export interface InjectionTestResult {
   defenseMechanism: string;
   timestamp: string;
 }
+
+export interface AuditLogItem {
+  id: string;
+  action: string;
+  ts: any;
+  metadata?: Record<string, any>;
+}

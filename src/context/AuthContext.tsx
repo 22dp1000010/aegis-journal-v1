@@ -12,7 +12,8 @@ import {
   signOut as firebaseSignOut,
   onAuthStateChanged,
 } from 'firebase/auth';
-import { auth, googleProvider } from '../firebase';
+import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
+import { auth, googleProvider, db } from '../firebase';
 
 interface AuthContextType {
   user: User | null;
@@ -46,12 +47,79 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     try {
       localStorage.setItem('aegis_user_aliases', JSON.stringify(aliases));
     } catch {}
+
+    // Persist to users/{uid}/profile/aliases in Firestore via server API
+    if (user) {
+      user.getIdToken().then((token) => {
+        if (token) {
+          fetch('/api/profile/aliases', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({ aliases }),
+          }).catch(() => {});
+        }
+      });
+    }
   };
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
       setLoading(false);
+
+      if (currentUser) {
+        // Tamper-evident audit log for sign-in session
+        const sessionKey = `aegis_signin_logged_${currentUser.uid}`;
+        if (!sessionStorage.getItem(sessionKey)) {
+          sessionStorage.setItem(sessionKey, 'true');
+          addDoc(collection(db, 'users', currentUser.uid, 'auditLogs'), {
+            action: 'sign-in',
+            ts: serverTimestamp(),
+            metadata: { provider: 'google.com' },
+          }).catch(async (auditErr) => {
+            console.warn('[Aegis Auth] Client audit log write error, dispatching to server:', auditErr);
+            try {
+              const token = await currentUser.getIdToken();
+              if (token) {
+                fetch('/api/audit', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                  },
+                  body: JSON.stringify({
+                    action: 'sign-in',
+                    metadata: { provider: 'google.com' },
+                  }),
+                }).catch(() => {});
+              }
+            } catch {}
+          });
+        }
+
+        try {
+          const token = await currentUser.getIdToken();
+          if (token) {
+            const res = await fetch('/api/profile/aliases', {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (res.ok) {
+              const data = await res.json();
+              if (Array.isArray(data.aliases) && data.aliases.length > 0) {
+                setUserAliasesState(data.aliases);
+                try {
+                  localStorage.setItem('aegis_user_aliases', JSON.stringify(data.aliases));
+                } catch {}
+              }
+            }
+          }
+        } catch (err) {
+          console.error('[Aegis Auth] Failed to load server aliases:', err);
+        }
+      }
     });
     return () => unsubscribe();
   }, []);
@@ -70,7 +138,31 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     setLoading(true);
     setError(null);
     try {
-      await signInWithPopup(auth, googleProvider);
+      const cred = await signInWithPopup(auth, googleProvider);
+      if (cred?.user) {
+        addDoc(collection(db, 'users', cred.user.uid, 'auditLogs'), {
+          action: 'sign-in',
+          ts: serverTimestamp(),
+          metadata: { provider: 'google.com' },
+        }).catch(async () => {
+          try {
+            const token = await cred.user.getIdToken();
+            if (token) {
+              fetch('/api/audit', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({
+                  action: 'sign-in',
+                  metadata: { provider: 'google.com' },
+                }),
+              }).catch(() => {});
+            }
+          } catch {}
+        });
+      }
     } catch (err: any) {
       console.error('[Aegis Auth] Google Sign-In Error:', err);
       setError(err?.message || 'Google Sign-In failed. Please try again.');

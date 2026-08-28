@@ -107,7 +107,75 @@ export function redactText(text: string, userAliases: string[] = []): RedactionR
     return token;
   };
 
-  // 1. User-Declared Aliases (e.g., specific employer names, bank names, family members)
+  // 1. Payment Cards (13-19 digits, separators normalized, Luhn-valid)
+  // Must run first to prevent fragments of spaced/hyphenated cards from being misclassified by Aadhaar or Account matchers.
+  // Match candidate sequences of digits separated by single spaces or hyphens, bounded by word/non-digit boundaries.
+  const cardCandidateRegex = /\b(?:\d[ -]?){12,18}\d\b/g;
+  processed = processed.replace(cardCandidateRegex, (match) => {
+    const rawDigits = match.replace(/\D/g, '');
+    if (rawDigits.length >= 13 && rawDigits.length <= 19 && validateLuhn(rawDigits)) {
+      return registerToken('CARD', match.trim());
+    }
+    return match;
+  });
+
+  // 2. IFSC & PAN (Alphanumeric patterns, unambiguous)
+  // 2a. Indian IFSC Code (4 letters, 0, 6 alphanumeric)
+  const ifscRegex = /\b[A-Z]{4}0[A-Z0-9]{6}\b/g;
+  processed = processed.replace(ifscRegex, (match) => registerToken('IFSC', match));
+
+  // 2b. Indian PAN Card (5 uppercase letters, 4 digits, 1 uppercase letter)
+  const panRegex = /\b[A-Z]{5}[0-9]{4}[A-Z]\b/g;
+  processed = processed.replace(panRegex, (match) => registerToken('PAN', match));
+
+  // 3. Indian Aadhaar Card (EXACTLY 12 digits AND Verhoeff checksum valid — reject otherwise)
+  const aadhaarRegex = /\b(?:\d{4}[ -]\d{4}[ -]\d{4}|\d{12})\b/g;
+  processed = processed.replace(aadhaarRegex, (match) => {
+    const raw = match.replace(/\D/g, '');
+    if (raw.length === 12 && validateVerhoeff(raw)) {
+      return registerToken('AADHAAR', match.trim());
+    }
+    return match;
+  });
+
+  // 4. Bank Account Numbers (9-18 digit runs not already consumed)
+  // 4a. Explicit account mentions with prefix
+  const explicitAcctRegex = /(?:\b(?:a\/c|acct|account|acc|savings|current|checking|acc\.?\s*no\.?)\s*(?:is|:|#|-)?\s*)([0-9]{9,18})\b/gi;
+  processed = processed.replace(explicitAcctRegex, (match, p1) => {
+    const token = registerToken('ACCT', p1);
+    return match.replace(p1, token);
+  });
+
+  // 4b. Standalone 9-18 digit runs (e.g. 004501234567, 12-digit non-Aadhaar numbers)
+  const standaloneAcctRegex = /\b[0-9]{9,18}\b/g;
+  processed = processed.replace(standaloneAcctRegex, (match) => {
+    // If not already replaced or part of token
+    if (match.length >= 9 && match.length <= 18) {
+      return registerToken('ACCT', match);
+    }
+    return match;
+  });
+
+  // 5. Phone, email, UPI, aliases
+  // 5a. Emails (before UPI to avoid collisions)
+  const emailRegex = /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g;
+  processed = processed.replace(emailRegex, (match) => registerToken('EMAIL', match));
+
+  // 5b. UPI Virtual Payment Address
+  const upiRegex = /\b[a-zA-Z0-9._-]{2,256}@(okaxis|okhdfcbank|oksbi|okicici|paytm|ybl|ibl|axl|upi|apl|fbl|sbi|hdfcbank|icici|kotak|barodampay|rbl|indus)\b/gi;
+  processed = processed.replace(upiRegex, (match) => registerToken('UPI', match));
+
+  // 5c. Phone numbers (E.164 and Indian 10-digit formats)
+  const phoneRegex = /(?:\+91[\s-]?)?[6789]\d{9}\b|\b\+?[1-9]\d{1,2}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g;
+  processed = processed.replace(phoneRegex, (match) => {
+    const digits = match.replace(/\D/g, '');
+    if (digits.length >= 10 && digits.length <= 13) {
+      return registerToken('PHONE', match.trim());
+    }
+    return match;
+  });
+
+  // 5d. User-Declared Aliases (e.g., specific employer names, bank names, family members)
   if (Array.isArray(userAliases)) {
     for (const alias of userAliases) {
       if (alias && alias.trim().length > 1) {
@@ -118,70 +186,6 @@ export function redactText(text: string, userAliases: string[] = []): RedactionR
       }
     }
   }
-
-  // 2. Emails (before UPI to avoid collisions)
-  const emailRegex = /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g;
-  processed = processed.replace(emailRegex, (match) => registerToken('EMAIL', match));
-
-  // 3. Indian PAN Card (5 uppercase letters, 4 digits, 1 uppercase letter)
-  const panRegex = /\b[A-Z]{5}[0-9]{4}[A-Z]\b/g;
-  processed = processed.replace(panRegex, (match) => registerToken('PAN', match));
-
-  // 4. Indian IFSC Code (4 letters, 0, 6 alphanumeric)
-  const ifscRegex = /\b[A-Z]{4}0[A-Z0-9]{6}\b/g;
-  processed = processed.replace(ifscRegex, (match) => registerToken('IFSC', match));
-
-  // 5. UPI Virtual Payment Address (e.g., user@okhdfcbank, name@paytm, 9876543210@ybl)
-  const upiRegex = /\b[a-zA-Z0-9._-]{2,256}@(okaxis|okhdfcbank|oksbi|okicici|paytm|ybl|ibl|axl|upi|apl|fbl|sbi|hdfcbank|icici|kotak|barodampay|rbl|indus)\b/gi;
-  processed = processed.replace(upiRegex, (match) => registerToken('UPI', match));
-
-  // 6. Payment Cards (13-19 digits, optionally spaced or hyphenated, verified with Luhn Check)
-  const cardCandidateRegex = /\b(?:\d[ -]*?){13,19}\b/g;
-  processed = processed.replace(cardCandidateRegex, (match) => {
-    const rawDigits = match.replace(/\D/g, '');
-    if (validateLuhn(rawDigits)) {
-      return registerToken('CARD', match.trim());
-    }
-    return match;
-  });
-
-  // 7. Indian Aadhaar Card (12 digits, checked with Verhoeff algorithm or 12-digit spaced sequence)
-  const aadhaarRegex = /\b\d{4}[ -]?\d{4}[ -]?\d{4}\b/g;
-  processed = processed.replace(aadhaarRegex, (match) => {
-    const raw = match.replace(/\D/g, '');
-    if (raw.length === 12 && (validateVerhoeff(raw) || /^[2-9]\d{11}$/.test(raw))) {
-      return registerToken('AADHAAR', match.trim());
-    }
-    return match;
-  });
-
-  // 8. Bank Account Numbers (9-18 digit runs preceded by terms like account, acct, A/C, or explicit long sequence)
-  const explicitAcctRegex = /(?:\b(?:a\/c|acct|account|acc|savings|current|checking|acc\.?\s*no\.?)\s*(?:is|:|#|-)?\s*)([0-9]{9,18})\b/gi;
-  processed = processed.replace(explicitAcctRegex, (match, p1) => {
-    const token = registerToken('ACCT', p1);
-    return match.replace(p1, token);
-  });
-
-  // Also catch isolated 10-18 digit numbers that are NOT dates, amounts (like 500000), or phone numbers
-  const standaloneAcctRegex = /\b[0-9]{11,18}\b/g;
-  processed = processed.replace(standaloneAcctRegex, (match) => {
-    // If not already part of a token
-    if (match.length >= 11) {
-      return registerToken('ACCT', match);
-    }
-    return match;
-  });
-
-  // 9. Phone numbers (E.164 and Indian 10-digit formats)
-  const phoneRegex = /(?:\+91[\s-]?)?[6789]\d{9}\b|\b\+?[1-9]\d{1,2}[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g;
-  processed = processed.replace(phoneRegex, (match) => {
-    // Avoid redacting pure 4-digit numbers or small amounts
-    const digits = match.replace(/\D/g, '');
-    if (digits.length >= 10 && digits.length <= 13) {
-      return registerToken('PHONE', match.trim());
-    }
-    return match;
-  });
 
   const detectedCategories = Object.keys(counts).filter((cat) => counts[cat] > 0);
 
