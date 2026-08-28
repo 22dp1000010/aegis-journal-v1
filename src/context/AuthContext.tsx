@@ -5,12 +5,13 @@
  * user aliases, and sign out capabilities.
  */
 
-import React, { createContext, useContext, useEffect, useState, ReactNode } from 'react';
+import React, { createContext, useContext, useEffect, useState, ReactNode, useCallback } from 'react';
 import {
   User,
   signInWithPopup,
   signOut as firebaseSignOut,
   onAuthStateChanged,
+  getIdTokenResult,
 } from 'firebase/auth';
 import { collection, addDoc, serverTimestamp } from 'firebase/firestore';
 import { auth, googleProvider, db } from '../firebase';
@@ -19,6 +20,9 @@ interface AuthContextType {
   user: User | null;
   loading: boolean;
   error: string | null;
+  isAdmin: boolean;
+  claims: Record<string, any>;
+  refreshClaims: () => Promise<void>;
   userAliases: string[];
   setUserAliases: (aliases: string[]) => void;
   getIdToken: () => Promise<string | null>;
@@ -33,6 +37,8 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
+  const [isAdmin, setIsAdmin] = useState<boolean>(false);
+  const [claims, setClaims] = useState<Record<string, any>>({});
   const [userAliases, setUserAliasesState] = useState<string[]>(() => {
     try {
       const saved = localStorage.getItem('aegis_user_aliases');
@@ -41,6 +47,29 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       return ['ICICI', 'HDFC', 'Chase', 'Acme Corp', 'Landlord'];
     }
   });
+
+  const checkClaims = useCallback(async (currentUser: User | null, forceRefresh = false) => {
+    if (!currentUser) {
+      setIsAdmin(false);
+      setClaims({});
+      return;
+    }
+    try {
+      const tokenResult = await getIdTokenResult(currentUser, forceRefresh);
+      const userClaims = tokenResult.claims || {};
+      setClaims(userClaims);
+      const adminClaim = userClaims.admin === true || userClaims.role === 'admin';
+      setIsAdmin(adminClaim);
+    } catch (err) {
+      console.warn('[Aegis Auth] Failed to inspect token claims:', err);
+    }
+  }, []);
+
+  const refreshClaims = useCallback(async () => {
+    if (auth.currentUser) {
+      await checkClaims(auth.currentUser, true);
+    }
+  }, [checkClaims]);
 
   const setUserAliases = (aliases: string[]) => {
     setUserAliasesState(aliases);
@@ -69,6 +98,7 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       setUser(currentUser);
       setLoading(false);
+      await checkClaims(currentUser);
 
       if (currentUser) {
         // Tamper-evident audit log for sign-in session
@@ -188,6 +218,9 @@ export const AuthProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
         user,
         loading,
         error,
+        isAdmin,
+        claims,
+        refreshClaims,
         userAliases,
         setUserAliases,
         getIdToken,

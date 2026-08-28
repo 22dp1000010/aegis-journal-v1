@@ -26,6 +26,8 @@ import {
   FieldValue,
   checkAndConsumeRateLimit,
   RATE_LIMIT_CONFIG,
+  recordSystemMetric,
+  getSystemMetrics,
 } from './src/server/firebaseAdmin.js';
 
 // Extend Express Request to include authenticated user
@@ -285,6 +287,13 @@ async function startServer() {
           capacity: result.capacity,
         });
 
+        // Record aggregated metric telemetry with opaque hashed UID (zero user content)
+        recordSystemMetric({
+          type: 'rate_limit_tripped',
+          uid,
+          statusCode: 429,
+        }).catch(() => {});
+
         const retryTimeStr = new Date(Date.now() + retryAfter * 1000).toLocaleTimeString([], {
           hour: '2-digit',
           minute: '2-digit',
@@ -338,6 +347,36 @@ async function startServer() {
         details: err?.message || 'Token verification error',
       });
     }
+  };
+
+  // 4. Delegated Administration Verification Middleware
+  // Verifies the "admin" role carried by a Firebase custom claim minted server-side via the Admin SDK.
+  // NEVER derived from a client-writable Firestore field, an email domain check, or a hardcoded UID list in client code.
+  // Re-verifies the claim server-side on every privileged request; never trusts a role asserted in a request body or parameters.
+  const requireAdmin = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    if (!req.user || !req.user.uid) {
+      return res.status(401).json({ error: 'Unauthorized: Authentication required.' });
+    }
+
+    // Inspect ONLY cryptographically verified claims from the decoded Firebase ID token.
+    // Explicitly reject any body/query/header role assertions
+    const token = req.user;
+    const hasAdminClaim = token.admin === true || token.role === 'admin';
+
+    if (!hasAdminClaim) {
+      // Record accountability audit event for blocked administrative attempt
+      await recordAuditEvent(req.user.uid, 'admin_access_denied', {
+        attemptedPath: req.originalUrl || req.path,
+        reason: 'Missing server-minted admin custom claim in verified ID token',
+      });
+
+      return res.status(403).json({
+        error: 'Forbidden: Delegated administrative access required.',
+        message: 'This operation requires a Firebase custom claim { admin: true } minted server-side via the Admin SDK.',
+      });
+    }
+
+    next();
   };
 
   // --- API ROUTES FIRST ---
@@ -588,6 +627,54 @@ async function startServer() {
     }
   });
 
+  // GET /api/auth/claims - Inspect cryptographically verified token claims
+  // Re-verifies server-minted token claims server-side on every request
+  app.get('/api/auth/claims', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    const user = req.user!;
+    const isAdmin = user.admin === true || user.role === 'admin';
+    res.json({
+      uid: user.uid,
+      email: user.email || null,
+      isAdmin,
+      claims: {
+        admin: user.admin || false,
+        role: user.role || (isAdmin ? 'admin' : 'user'),
+        iss: user.iss,
+        aud: user.aud,
+        auth_time: user.auth_time,
+      },
+    });
+  });
+
+  // GET /api/admin/metrics - Delegated Administration Dashboard Telemetry
+  // Reads ONLY from pre-aggregated system_metrics collection.
+  // STRICT INVARIANT: Contains zero entry text, zero user prose, and only opaque hashed UIDs.
+  // There is no code path and no rule granting an admin read access to entry content.
+  // Every administrative read emits its own tamper-evident audit event: Administrators are accountable principals, not exempt ones!
+  app.get('/api/admin/metrics', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+    const adminUid = req.user!.uid;
+    try {
+      // Administrators are accountable principals: emit audit event for administrative read
+      await recordAuditEvent(adminUid, 'admin_metrics_read', {
+        adminUid,
+        targetCollection: 'system_metrics',
+        telemetryScope: 'counts_latencies_error_rates',
+        containsUserData: false,
+        zeroDataAccessEnforced: true,
+      });
+
+      const metrics = await getSystemMetrics();
+      res.json({
+        success: true,
+        adminUid,
+        metrics,
+      });
+    } catch (err: any) {
+      console.error('[Aegis Admin] Failed to retrieve system metrics:', err);
+      res.status(500).json({ error: 'Failed to retrieve administrative metrics.' });
+    }
+  });
+
   // GET /api/entries - List all entries for authenticated user
   app.get('/api/entries', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     const uid = req.user!.uid;
@@ -674,6 +761,7 @@ async function startServer() {
 
   // POST /api/entries - Create a new reflection entry
   app.post('/api/entries', requireAuth, rateLimiter, async (req: AuthenticatedRequest, res: Response) => {
+    const startTime = Date.now();
     const uid = req.user!.uid;
     const body = req.body && typeof req.body === 'object' ? req.body : {};
     const content = typeof body.content === 'string' ? body.content.trim() : '';
@@ -760,6 +848,18 @@ async function startServer() {
         model: geminiResult.modelUsed,
       });
 
+      // Record pre-aggregated system metric with opaque hashed UID (zero user content)
+      const latencyMs = Date.now() - startTime;
+      const tokensCount = Object.values(redactionResult.redactionCounts).reduce((a, b) => a + b, 0);
+      recordSystemMetric({
+        type: 'reflection_created',
+        uid,
+        latencyMs,
+        tokensCount,
+        statusCode: 201,
+        modelTier: geminiResult.modelUsed,
+      }).catch(() => {});
+
       // 6. Return response to authenticated owner with rehydrated view for display
       res.status(201).json({
         success: true,
@@ -776,6 +876,14 @@ async function startServer() {
         createdAt: new Date().toISOString(),
       });
     } catch (err: any) {
+      recordSystemMetric({
+        type: 'api_error',
+        uid,
+        latencyMs: Date.now() - startTime,
+        statusCode: 500,
+        errorClass: err?.name || 'Error',
+      }).catch(() => {});
+
       console.error('[Aegis Journal] Failed to create entry:', err);
       res.status(500).json({
         error: 'Failed to process financial reflection.',
@@ -786,6 +894,7 @@ async function startServer() {
 
   // POST /api/entries/:id/messages - Add multi-turn message to an existing reflection
   app.post('/api/entries/:id/messages', requireAuth, rateLimiter, async (req: AuthenticatedRequest, res: Response) => {
+    const startTime = Date.now();
     const uid = req.user!.uid;
     const entryId = req.params.id;
     const body = req.body && typeof req.body === 'object' ? req.body : {};
@@ -900,6 +1009,18 @@ async function startServer() {
         model: geminiResult.modelUsed,
       });
 
+      // Record pre-aggregated system metric with opaque hashed UID (zero user content)
+      const latencyMs = Date.now() - startTime;
+      const tokensCount = Object.values(redactionResult.redactionCounts).reduce((a, b) => a + b, 0);
+      recordSystemMetric({
+        type: 'message_sent',
+        uid,
+        latencyMs,
+        tokensCount,
+        statusCode: 201,
+        modelTier: geminiResult.modelUsed,
+      }).catch(() => {});
+
       res.status(201).json({
         success: true,
         userMessage: {
@@ -918,6 +1039,14 @@ async function startServer() {
         },
       });
     } catch (err: any) {
+      recordSystemMetric({
+        type: 'api_error',
+        uid,
+        latencyMs: Date.now() - startTime,
+        statusCode: 500,
+        errorClass: err?.name || 'Error',
+      }).catch(() => {});
+
       console.error('[Aegis Journal] Failed to add message:', err);
       res.status(500).json({
         error: 'Failed to process message.',

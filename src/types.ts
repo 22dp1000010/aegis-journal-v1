@@ -78,3 +78,35 @@ export interface AuditLogItem {
   ts: any;
   metadata?: Record<string, any>;
 }
+
+export interface AdminMetricEvent {
+  id: string;
+  type: string;
+  hashedUid: string;
+  latencyMs: number;
+  tokensCount: number;
+  statusCode: number;
+  timestamp: string;
+}
+
+export interface SystemMetricsSummary {
+  totalReflections: number;
+  totalMessages: number;
+  totalTokensRedacted: number;
+  avgLatencyMs: number;
+  p95LatencyMs: number;
+  errorRatePercent: number;
+  rateLimitTrips: number;
+  activeHashedUsersCount: number;
+  recentHashedUsers: string[];
+  recentMetricEvents: AdminMetricEvent[];
+  lastCalculated: string;
+  zeroDataAccessEnforced: boolean;
+}
+
+export interface AdminClaimsInfo {
+  isAdmin: boolean;
+  uid: string;
+  claims: Record<string, any>;
+  issuedAt?: string;
+}

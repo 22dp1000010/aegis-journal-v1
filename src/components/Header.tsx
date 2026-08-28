@@ -13,7 +13,7 @@ interface HeaderProps {
 }
 
 export const Header: React.FC<HeaderProps> = ({ currentView, onNavigate, onOpenAliasManager }) => {
-  const { user, signOut } = useAuth();
+  const { user, signOut, isAdmin } = useAuth();
 
   return (
     <header
@@ -128,6 +128,11 @@ export const Header: React.FC<HeaderProps> = ({ currentView, onNavigate, onOpenA
                 <span className="text-xs text-gray-300 font-medium hidden lg:inline max-w-[120px] truncate font-mono">
                   {user.displayName || user.email?.split('@')[0]}
                 </span>
+                {isAdmin && (
+                  <span className="text-[10px] font-mono font-bold bg-purple-950 text-purple-300 border border-purple-800/80 px-1.5 py-0.5 rounded hidden sm:inline-block">
+                    ADMIN
+                  </span>
+                )}
               </div>
 
               <button
