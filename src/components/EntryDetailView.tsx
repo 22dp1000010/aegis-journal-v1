@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { JournalEntry, EntryMessage } from '../types';
 import { useAuth } from '../context/AuthContext';
+import { RetryToast } from './RetryToast';
 
 interface EntryDetailViewProps {
   entry: JournalEntry;
@@ -36,6 +37,24 @@ export const EntryDetailView: React.FC<EntryDetailViewProps> = ({ entry, onBack 
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isToastOpen, setIsToastOpen] = useState(false);
+  const [rateLimitSeconds, setRateLimitSeconds] = useState<number | null>(null);
+  const [rateLimitTargetTime, setRateLimitTargetTime] = useState<string | null>(null);
+
+  // Active countdown timer for rate limit cooldown (Directive 11)
+  useEffect(() => {
+    if (rateLimitSeconds === null || rateLimitSeconds <= 0) return;
+    const interval = setInterval(() => {
+      setRateLimitSeconds((prev) => {
+        if (prev === null || prev <= 1) {
+          clearInterval(interval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [rateLimitSeconds]);
 
   // Fetch full conversation history on mount if not provided
   useEffect(() => {
@@ -76,6 +95,7 @@ export const EntryDetailView: React.FC<EntryDetailViewProps> = ({ entry, onBack 
     const currentText = inputText.trim();
     setIsSending(true);
     setError(null);
+    setIsToastOpen(false);
 
     try {
       const idToken = await getIdToken();
@@ -95,6 +115,25 @@ export const EntryDetailView: React.FC<EntryDetailViewProps> = ({ entry, onBack 
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
+        if (response.status === 429) {
+          const retrySec =
+            Number(response.headers.get('Retry-After')) ||
+            Number(errData.retryAfterSeconds) ||
+            60;
+          const targetTime = new Date(Date.now() + retrySec * 1000).toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          });
+          setRateLimitSeconds(retrySec);
+          setRateLimitTargetTime(targetTime);
+          setError(
+            errData.error ||
+              `Rate limit reached. You can send another reply in ${retrySec} seconds (available at ${targetTime}).`
+          );
+          setIsToastOpen(true);
+          return;
+        }
         throw new Error(errData.error || 'Failed to send message.');
       }
 
@@ -105,9 +144,11 @@ export const EntryDetailView: React.FC<EntryDetailViewProps> = ({ entry, onBack 
         result.modelMessage,
       ]);
       setInputText('');
+      setIsToastOpen(false);
     } catch (err: any) {
       console.error('Failed to send multi-turn reply:', err);
       setError(err?.message || 'Failed to send reply.');
+      setIsToastOpen(true);
     } finally {
       setIsSending(false);
     }
@@ -287,10 +328,26 @@ export const EntryDetailView: React.FC<EntryDetailViewProps> = ({ entry, onBack 
       {/* Multi-turn Chat Input Box */}
       <form onSubmit={handleSendMessage} className="bg-[#0F0F0F] border border-[#222] rounded-xl p-4 shadow-md">
         {error && (
-          <div className="mb-3 p-3 bg-rose-950/40 border border-rose-800 text-rose-300 text-xs rounded-lg flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-            <span>{error}</span>
-          </div>
+          rateLimitSeconds !== null && rateLimitSeconds > 0 ? (
+            <div className="mb-3 p-3 bg-amber-950/40 border border-amber-800/80 text-amber-200 text-xs rounded-lg flex items-start gap-2.5 shadow-sm">
+              <Clock className="w-4 h-4 text-amber-400 shrink-0 mt-0.5 animate-pulse" />
+              <div className="flex-1">
+                <span className="font-semibold block text-amber-100">Rate Limit Active (Directive 11)</span>
+                <p className="mt-0.5">
+                  Token bucket throttle engaged to protect Gemini quotas. You can send another message in{' '}
+                  <span className="font-mono font-bold text-amber-300 bg-amber-900/60 px-1 py-0.5 rounded border border-amber-700/50">
+                    {rateLimitSeconds}s
+                  </span>{' '}
+                  {rateLimitTargetTime && `(available at ${rateLimitTargetTime})`}.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div className="mb-3 p-3 bg-rose-950/40 border border-rose-800 text-rose-300 text-xs rounded-lg flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )
         )}
 
         <div className="flex items-center gap-2">
@@ -299,17 +356,22 @@ export const EntryDetailView: React.FC<EntryDetailViewProps> = ({ entry, onBack 
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
             placeholder="Reply to the reflection or explore why this financial moment felt stressful..."
-            disabled={isSending}
-            className="flex-1 px-3.5 py-2.5 bg-[#141414] border border-[#333] rounded-lg text-xs sm:text-sm text-white placeholder-gray-600 focus:outline-hidden focus:border-emerald-500 transition-all font-sans"
+            disabled={isSending || (rateLimitSeconds !== null && rateLimitSeconds > 0)}
+            className="flex-1 px-3.5 py-2.5 bg-[#141414] border border-[#333] rounded-lg text-xs sm:text-sm text-white placeholder-gray-600 focus:outline-hidden focus:border-emerald-500 transition-all font-sans disabled:opacity-50"
           />
 
           <button
             type="submit"
-            disabled={isSending || !inputText.trim()}
+            disabled={isSending || !inputText.trim() || (rateLimitSeconds !== null && rateLimitSeconds > 0)}
             className="inline-flex items-center gap-1.5 bg-white hover:bg-gray-200 active:bg-gray-300 text-black text-xs sm:text-sm font-semibold px-4 py-2.5 rounded-lg shadow-sm transition-all disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
           >
             {isSending ? (
               <Loader2 className="w-4 h-4 animate-spin text-black" />
+            ) : rateLimitSeconds !== null && rateLimitSeconds > 0 ? (
+              <>
+                <Clock className="w-3.5 h-3.5 text-black animate-pulse" />
+                <span>Wait {rateLimitSeconds}s</span>
+              </>
             ) : (
               <>
                 <span>Send</span>
@@ -324,6 +386,22 @@ export const EntryDetailView: React.FC<EntryDetailViewProps> = ({ entry, onBack 
           <span>Follow-up replies pass through the same server redaction gateway before model invocation.</span>
         </p>
       </form>
+
+      {/* Resilient Retry Toast (Directive 6: Never clears user input buffer on failed write) */}
+      <RetryToast
+        isOpen={isToastOpen}
+        title="Message Delivery Failed"
+        errorMessage={error || 'Failed to deliver message to reflection thread.'}
+        bufferCharacterCount={inputText.length}
+        rateLimitSeconds={rateLimitSeconds}
+        rateLimitTargetTime={rateLimitTargetTime}
+        isRetrying={isSending}
+        onRetry={() => {
+          const fakeEvent = { preventDefault: () => {} } as React.FormEvent;
+          handleSendMessage(fakeEvent);
+        }}
+        onDismiss={() => setIsToastOpen(false)}
+      />
     </div>
   );
 };

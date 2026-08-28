@@ -46,9 +46,16 @@ export interface RedactionInspectionItem {
 export interface CustodyStatus {
   runtimeEnvironment: string;
   serverBoundKey: boolean;
+  keySource?: string;
   clientKeyExposure: boolean;
+  clientFilesScanned?: number;
+  clientScanStatus?: string;
+  clientAuditPerformed?: boolean;
+  clientScannedFiles?: string[];
   keyConfigured: boolean;
   keyMask: string;
+  cloudRunService?: string | null;
+  cloudRunRevision?: string | null;
   databaseId: string;
   isolationModel: string;
   piiRedactionGateway: string;

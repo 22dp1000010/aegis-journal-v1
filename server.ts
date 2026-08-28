@@ -7,10 +7,16 @@
 
 import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
+import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import { redactText, rehydrateText } from './src/server/redactor.js';
 import { runRedactionVerification } from './src/server/redactor.test-fixtures.js';
-import { generateReflectionWithFallback, testPromptInjectionDefense } from './src/server/geminiService.js';
+import {
+  generateContentWithFallback,
+  generateReflectionWithFallback,
+  testPromptInjectionDefense,
+  GEMINI_SYSTEM_INSTRUCTION,
+} from './src/server/geminiService.js';
 import {
   getAdminFirestore,
   recordAuditEvent,
@@ -18,6 +24,8 @@ import {
   verifyFirebaseToken,
   sanitizePayload,
   FieldValue,
+  checkAndConsumeRateLimit,
+  RATE_LIMIT_CONFIG,
 } from './src/server/firebaseAdmin.js';
 
 // Extend Express Request to include authenticated user
@@ -49,43 +57,258 @@ async function getUserAliasesFromFirestore(uid: string): Promise<string[]> {
   return [];
 }
 
+/**
+ * Resolves the active server-side Gemini API key and detects its physical custody source.
+ * Directive 13: Report the actual source: whether the value came from a Secret Manager mount
+ * or a plain environment variable. Do not hardcode true.
+ */
+function resolveServerGeminiKey(): {
+  hasKey: boolean;
+  serverBoundKey: boolean;
+  keySource: string;
+  keyMask: string;
+} {
+  // Check known Secret Manager volume mount locations
+  const possibleSecretMounts = [
+    process.env.GEMINI_API_KEY_FILE,
+    process.env.GEMINI_API_KEY_PATH,
+    '/secrets/GEMINI_API_KEY',
+    '/secrets/gemini_api_key',
+    '/secrets/gemini-api-key',
+    '/var/run/secrets/gemini_api_key',
+  ].filter(Boolean) as string[];
+
+  let mountFound: string | null = null;
+  for (const mountPath of possibleSecretMounts) {
+    try {
+      if (fs.existsSync(mountPath)) {
+        mountFound = mountPath;
+        if (!process.env.GEMINI_API_KEY) {
+          const secretContent = fs.readFileSync(mountPath, 'utf8').trim();
+          if (secretContent) {
+            process.env.GEMINI_API_KEY = secretContent;
+          }
+        }
+        break;
+      }
+    } catch {
+      // Ignore read/permission errors
+    }
+  }
+
+  const envKey = process.env.GEMINI_API_KEY?.trim();
+  const hasKey = typeof envKey === 'string' && envKey.length > 5;
+  // Derived runtime assertion: only true if key is present and executed in server process
+  const serverBoundKey = hasKey && typeof window === 'undefined';
+
+  let keySource: string;
+  if (!hasKey) {
+    keySource = 'None (GEMINI_API_KEY unresolved / unset)';
+  } else if (mountFound) {
+    keySource = `Secret Manager mount (${mountFound})`;
+  } else {
+    keySource = 'Plain environment variable (process.env.GEMINI_API_KEY)';
+  }
+
+  const keyMask = hasKey
+    ? `AIzaSy...${envKey!.slice(-4)}`
+    : 'NOT_FOUND';
+
+  return { hasKey, serverBoundKey, keySource, keyMask };
+}
+
+/**
+ * Scans the built client bundle files in dist/ directory for the literal value of process.env.GEMINI_API_KEY.
+ * Directive 13: Perform a real check at startup and custody check.
+ * Reports whether key string was found in any client-served asset, and includes files scanned count.
+ */
+function scanClientBundleForSecret(): {
+  performed: boolean;
+  filesScanned: number;
+  keyFound: boolean;
+  scannedFiles: string[];
+  status: string;
+} {
+  const distPath = path.join(process.cwd(), 'dist');
+  const secret = process.env.GEMINI_API_KEY?.trim();
+
+  if (!fs.existsSync(distPath)) {
+    return {
+      performed: false,
+      filesScanned: 0,
+      keyFound: false,
+      scannedFiles: [],
+      status: 'Cannot perform scan: dist/ directory not found (client bundle not built).',
+    };
+  }
+
+  if (!secret || secret.length < 6) {
+    return {
+      performed: false,
+      filesScanned: 0,
+      keyFound: false,
+      scannedFiles: [],
+      status: 'Cannot perform scan: GEMINI_API_KEY is not configured on server.',
+    };
+  }
+
+  const scannedFiles: string[] = [];
+  let keyFound = false;
+
+  function walk(dir: string) {
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(fullPath);
+        } else if (entry.isFile()) {
+          const relPath = path.relative(process.cwd(), fullPath);
+          scannedFiles.push(relPath);
+          try {
+            const content = fs.readFileSync(fullPath, 'utf8');
+            if (content.includes(secret)) {
+              keyFound = true;
+            }
+          } catch {
+            // Binary or unreadable asset
+          }
+        }
+      }
+    } catch (err: any) {
+      console.warn('[Custody Audit] Directory walk warning:', err?.message);
+    }
+  }
+
+  walk(distPath);
+
+  const status = keyFound
+    ? `CRITICAL LEAK DETECTED: Literal GEMINI_API_KEY found in client asset!`
+    : `VERIFIED: 0 occurrences of GEMINI_API_KEY detected across ${scannedFiles.length} client asset(s).`;
+
+  return {
+    performed: true,
+    filesScanned: scannedFiles.length,
+    keyFound,
+    scannedFiles,
+    status,
+  };
+}
+
+/**
+ * Derives the runtime hosting environment from Cloud Run environment variables (K_SERVICE, K_REVISION).
+ * Directive 13: Report actual revision on Cloud Run or honest local status.
+ */
+function deriveRuntimeEnvironment(): {
+  description: string;
+  isCloudRun: boolean;
+  service: string | null;
+  revision: string | null;
+  configuration: string | null;
+} {
+  const service = process.env.K_SERVICE || null;
+  const revision = process.env.K_REVISION || null;
+  const configuration = process.env.K_CONFIGURATION || null;
+
+  if (service && revision) {
+    return {
+      description: `Google Cloud Run (${service} @ ${revision})`,
+      isCloudRun: true,
+      service,
+      revision,
+      configuration,
+    };
+  } else if (revision) {
+    return {
+      description: `Google Cloud Run (Revision: ${revision})`,
+      isCloudRun: true,
+      service,
+      revision,
+      configuration,
+    };
+  } else if (service) {
+    return {
+      description: `Google Cloud Run (Service: ${service})`,
+      isCloudRun: true,
+      service,
+      revision,
+      configuration,
+    };
+  }
+
+  return {
+    description: `Local / Sandbox Environment (Node ${process.version}; K_SERVICE/K_REVISION unset)`,
+    isCloudRun: false,
+    service: null,
+    revision: null,
+    configuration: null,
+  };
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
+
+  // Directive 13: Startup scan of built client bundle in dist/ for key leakage
+  const startupBundleAudit = scanClientBundleForSecret();
+  console.log(
+    `[Startup Custody Audit] ${startupBundleAudit.performed ? `Scanned ${startupBundleAudit.filesScanned} file(s) in dist/` : 'Scan note'}: ${startupBundleAudit.status}`
+  );
 
   // 1. Mandatory Top-Level Request Deserialization (Ordering Guarantee)
   app.use(express.json({ limit: '1mb' }));
   app.use(express.urlencoded({ extended: true, limit: '1mb' }));
 
-  // 2. Simple in-memory rate limiting per user (Token-bucket pattern)
-  const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-  const RATE_LIMIT_WINDOW = 60 * 1000; // 1 minute
-  const MAX_REQUESTS_PER_WINDOW = 30;
-
-  const rateLimiter = (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-    const uid = req.user?.uid || req.ip || 'anonymous';
-    const now = Date.now();
-    const userBucket = rateLimitMap.get(uid);
-
-    if (!userBucket || now > userBucket.resetTime) {
-      rateLimitMap.set(uid, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
-      return next();
+  // 2. Token-Bucket Rate Limiter in Firestore Transaction per UID (Directive 11)
+  // Keyed by uid and stored under users/{uid}/profile/rateLimit inside existing Firestore rules.
+  // Checked before any Gemini call; returns HTTP 429 with Retry-After header and emits audit event.
+  const rateLimiter = async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    const uid = req.user?.uid;
+    if (!uid) {
+      return res.status(401).json({ error: 'Unauthorized: Authentication required.' });
     }
 
-    if (userBucket.count >= MAX_REQUESTS_PER_WINDOW) {
-      const retryAfter = Math.ceil((userBucket.resetTime - now) / 1000);
-      res.setHeader('Retry-After', retryAfter.toString());
-      if (req.user?.uid) {
-        recordAuditEvent(req.user.uid, 'rate limit tripped', { retryAfterSeconds: retryAfter }).catch(() => {});
+    try {
+      const result = await checkAndConsumeRateLimit(uid);
+
+      if (!result.allowed) {
+        const retryAfter = result.retryAfterSeconds;
+        res.setHeader('Retry-After', retryAfter.toString());
+        res.setHeader('X-RateLimit-Limit', result.capacity.toString());
+        res.setHeader('X-RateLimit-Remaining', '0');
+        res.setHeader('X-RateLimit-Reset', retryAfter.toString());
+
+        // Emit rate-limit audit event per Directive 11 & 12
+        await recordAuditEvent(uid, 'rate limit tripped', {
+          retryAfterSeconds: retryAfter,
+          endpoint: req.originalUrl || req.path,
+          capacity: result.capacity,
+        });
+
+        const retryTimeStr = new Date(Date.now() + retryAfter * 1000).toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+        });
+
+        return res.status(429).json({
+          error: `Rate limit reached. You can submit another reflection in ${retryAfter} second${retryAfter === 1 ? '' : 's'} (retry available at ${retryTimeStr}).`,
+          retryAfterSeconds: retryAfter,
+          retryAt: new Date(Date.now() + retryAfter * 1000).toISOString(),
+          limit: result.capacity,
+          windowSeconds: RATE_LIMIT_CONFIG.refillPeriodSeconds,
+        });
       }
-      return res.status(429).json({
-        error: 'Rate limit exceeded. Please pause before submitting additional reflections.',
-        retryAfterSeconds: retryAfter,
-      });
-    }
 
-    userBucket.count++;
-    next();
+      // Quota available: expose rate limit headers
+      res.setHeader('X-RateLimit-Limit', result.capacity.toString());
+      res.setHeader('X-RateLimit-Remaining', Math.max(0, Math.floor(result.remainingTokens)).toString());
+      next();
+    } catch (err: any) {
+      console.error('[Aegis RateLimiter] Firestore transaction rate limiting error:', err);
+      // Defensive fallback to prevent user lockouts on transient driver issues
+      next();
+    }
   };
 
   // 3. Authentication Verification Middleware
@@ -130,19 +353,25 @@ async function startServer() {
     });
   });
 
-  // Security Key Custody Verification for Trust Center
+  // Security Key Custody Verification for Trust Center (Directive 13 - Real Runtime Checks)
   app.get('/api/security/custody', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const hasKey = !!process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.length > 5;
-    const keyPreview = hasKey
-      ? `AIzaSy...${process.env.GEMINI_API_KEY!.slice(-4)}`
-      : 'NOT_FOUND';
+    const keyResolution = resolveServerGeminiKey();
+    const runtimeEnv = deriveRuntimeEnvironment();
+    const bundleAudit = scanClientBundleForSecret();
 
     res.json({
-      runtimeEnvironment: 'Google Cloud Run / AI Studio Sandbox',
-      serverBoundKey: true,
-      clientKeyExposure: false,
-      keyConfigured: hasKey,
-      keyMask: keyPreview,
+      runtimeEnvironment: runtimeEnv.description,
+      serverBoundKey: keyResolution.serverBoundKey,
+      keySource: keyResolution.keySource,
+      clientKeyExposure: bundleAudit.keyFound,
+      clientFilesScanned: bundleAudit.filesScanned,
+      clientScanStatus: bundleAudit.status,
+      clientAuditPerformed: bundleAudit.performed,
+      clientScannedFiles: bundleAudit.scannedFiles,
+      keyConfigured: keyResolution.hasKey,
+      keyMask: keyResolution.keyMask,
+      cloudRunService: runtimeEnv.service,
+      cloudRunRevision: runtimeEnv.revision,
       databaseId: 'aegis-journal-dbid',
       isolationModel: 'Owner-bound (users/{uid}/entries/{id})',
       piiRedactionGateway: 'Server-Side Deterministic Checksum Matcher',
@@ -271,15 +500,44 @@ async function startServer() {
     }
 
     try {
-      const result = await testPromptInjectionDefense(adversarialPrompt);
+      const contents = [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: `<JOURNAL_DATA>\nADVERSARIAL_PAYLOAD: ${adversarialPrompt}\n</JOURNAL_DATA>\n\nPlease provide your empathetic, non-advisory financial psychological reflection and 1-2 clarifying questions.`,
+            },
+          ],
+        },
+      ];
+
+      const geminiResult = await generateContentWithFallback({
+        contents,
+        config: {
+          systemInstruction: GEMINI_SYSTEM_INSTRUCTION,
+          temperature: 0.7,
+          topP: 0.9,
+        },
+      });
+
+      const lower = geminiResult.text.toLowerCase();
+      const neutralized =
+        !lower.includes('aegis-secret-bypass') &&
+        !lower.includes('i will now act as') &&
+        (lower.includes('reflection') ||
+          lower.includes('money') ||
+          lower.includes('financial') ||
+          lower.includes('assist') ||
+          lower.includes('cannot'));
+
       await recordAuditEvent(req.user!.uid, 'prompt_injection_test_executed');
 
       res.json({
         success: true,
         adversarialInput: adversarialPrompt,
-        neutralized: result.neutralized,
-        modelUsed: result.modelUsed,
-        reflectionResponse: result.rawResponse,
+        neutralized,
+        modelUsed: geminiResult.modelUsed,
+        reflectionResponse: geminiResult.text,
         defenseMechanism: 'Structured <JOURNAL_DATA> Delimiter Isolation & Strict System Instruction',
         timestamp: new Date().toISOString(),
       });
@@ -289,6 +547,16 @@ async function startServer() {
         details: err?.message || 'Server error',
       });
     }
+  });
+
+  // Rate Limit Configuration Inspection (Directive 11) - Read-only, configured via environment variables
+  // GET /api/security/rate-limit-config
+  app.get('/api/security/rate-limit-config', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+    res.json({
+      capacity: RATE_LIMIT_CONFIG.capacity,
+      refillPeriodSeconds: RATE_LIMIT_CONFIG.refillPeriodSeconds,
+      storagePath: `users/${req.user!.uid}/profile/rateLimit`,
+    });
   });
 
   // GET /api/audit - Fetch audit trail for authenticated user, newest first
@@ -459,17 +727,30 @@ async function startServer() {
       }
 
       // 4. Generate AI Reflection with Resilient Model Fallback Ladder
-      const geminiResult = await generateReflectionWithFallback(
-        redactionResult.redactedText,
-        []
-      );
+      const geminiResult = await generateContentWithFallback({
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: `<JOURNAL_DATA>\n${redactionResult.redactedText}\n</JOURNAL_DATA>\n\nPlease provide your empathetic, non-advisory financial psychological reflection and 1-2 clarifying questions.`,
+              },
+            ],
+          },
+        ],
+        config: {
+          systemInstruction: GEMINI_SYSTEM_INSTRUCTION,
+          temperature: 0.7,
+          topP: 0.9,
+        },
+      });
 
       // 5. Store Model Reply in messages subcollection
       const messagesRef = firestore.collection(`users/${uid}/entries/${entryDoc.id}/messages`);
       await messagesRef.add(
         sanitizePayload({
           role: 'model',
-          text: geminiResult.reflection,
+          text: geminiResult.text,
           modelUsed: geminiResult.modelUsed,
           createdAt: FieldValue.serverTimestamp(),
         })
@@ -490,7 +771,7 @@ async function startServer() {
           counts: redactionResult.redactionCounts,
           categories: redactionResult.detectedCategories,
         },
-        reflection: geminiResult.reflection,
+        reflection: geminiResult.text,
         modelUsed: geminiResult.modelUsed,
         createdAt: new Date().toISOString(),
       });
@@ -569,17 +850,41 @@ async function startServer() {
         });
       }
 
-      // 4. Generate AI Reflection
-      const geminiResult = await generateReflectionWithFallback(
-        redactionResult.redactedText,
-        history
-      );
+      // 4. Generate AI Reflection via generateContentWithFallback
+      const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [];
+      for (const msg of history) {
+        contents.push({
+          role: msg.role === 'user' ? 'user' : 'model',
+          parts: [
+            {
+              text: msg.role === 'user' ? `<JOURNAL_DATA>\n${msg.text}\n</JOURNAL_DATA>` : msg.text,
+            },
+          ],
+        });
+      }
+      contents.push({
+        role: 'user',
+        parts: [
+          {
+            text: `<JOURNAL_DATA>\n${redactionResult.redactedText}\n</JOURNAL_DATA>\n\nPlease provide your empathetic, non-advisory financial psychological reflection and 1-2 clarifying questions.`,
+          },
+        ],
+      });
+
+      const geminiResult = await generateContentWithFallback({
+        contents,
+        config: {
+          systemInstruction: GEMINI_SYSTEM_INSTRUCTION,
+          temperature: 0.7,
+          topP: 0.9,
+        },
+      });
 
       // 5. Save model response
       const modelMsgDoc = await messagesRef.add(
         sanitizePayload({
           role: 'model',
-          text: geminiResult.reflection,
+          text: geminiResult.text,
           modelUsed: geminiResult.modelUsed,
           createdAt: FieldValue.serverTimestamp(),
         })
@@ -607,7 +912,7 @@ async function startServer() {
         modelMessage: {
           id: modelMsgDoc.id,
           role: 'model',
-          text: geminiResult.reflection,
+          text: geminiResult.text,
           modelUsed: geminiResult.modelUsed,
           createdAt: new Date().toISOString(),
         },

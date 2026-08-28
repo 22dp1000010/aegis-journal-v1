@@ -5,7 +5,7 @@
  * and resilient submit handlers preserving buffer on failure.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   PenLine,
   Sparkles,
@@ -16,9 +16,12 @@ import {
   Loader2,
   CheckCircle2,
   RefreshCw,
+  Clock,
+  AlertTriangle,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { JournalEntry } from '../types';
+import { RetryToast } from './RetryToast';
 
 interface JournalEditorProps {
   onEntryCreated: (entry: JournalEntry) => void;
@@ -53,6 +56,24 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitStep, setSubmitStep] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [isToastOpen, setIsToastOpen] = useState(false);
+  const [rateLimitSeconds, setRateLimitSeconds] = useState<number | null>(null);
+  const [rateLimitTargetTime, setRateLimitTargetTime] = useState<string | null>(null);
+
+  // Active countdown timer for rate limit cooldown (Directive 11)
+  useEffect(() => {
+    if (rateLimitSeconds === null || rateLimitSeconds <= 0) return;
+    const interval = setInterval(() => {
+      setRateLimitSeconds((prev) => {
+        if (prev === null || prev <= 1) {
+          clearInterval(interval);
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [rateLimitSeconds]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -63,6 +84,7 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
 
     setIsSubmitting(true);
     setErrorMessage(null);
+    setIsToastOpen(false);
     setSubmitStep('1. Tokenizing identifiers via Server Redaction Gateway...');
 
     try {
@@ -88,6 +110,25 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
+        if (response.status === 429) {
+          const retrySec =
+            Number(response.headers.get('Retry-After')) ||
+            Number(errorData.retryAfterSeconds) ||
+            60;
+          const targetTime = new Date(Date.now() + retrySec * 1000).toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          });
+          setRateLimitSeconds(retrySec);
+          setRateLimitTargetTime(targetTime);
+          setErrorMessage(
+            errorData.error ||
+              `Rate limit reached. You can submit another reflection in ${retrySec} seconds (available at ${targetTime}).`
+          );
+          setIsToastOpen(true);
+          return;
+        }
         throw new Error(
           errorData.error || `Server returned ${response.status}: ${response.statusText}`
         );
@@ -95,6 +136,7 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
 
       const result = await response.json();
       setSubmitStep('3. Complete! Loading reflection...');
+      setIsToastOpen(false);
 
       // Transition to detail view with newly created entry
       onEntryCreated({
@@ -118,6 +160,7 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
       console.error('[Aegis Journal] Failed to create entry:', err);
       // Input buffer is deliberately preserved so user doesn't lose thoughts!
       setErrorMessage(err?.message || 'Failed to process reflection. Please check your connection and retry.');
+      setIsToastOpen(true);
     } finally {
       setIsSubmitting(false);
       setSubmitStep('');
@@ -241,26 +284,57 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
           </div>
         )}
 
-        {/* Error Banner with Retry */}
+        {/* Error Banner with Specific Rate Limit Display (Directive 11) */}
         {errorMessage && (
-          <div className="mb-5 p-4 bg-rose-950/40 border border-rose-800 rounded-lg text-rose-300 text-xs flex items-start justify-between gap-3">
-            <div className="flex items-start gap-2">
-              <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-              <div>
-                <strong className="font-semibold block text-rose-200">Failed to process reflection</strong>
-                <p className="mt-0.5">{errorMessage}</p>
-                <p className="text-[11px] text-rose-400 mt-1">Your reflection buffer is preserved below.</p>
+          rateLimitSeconds !== null && rateLimitSeconds > 0 ? (
+            <div className="mb-5 p-4 bg-amber-950/40 border border-amber-800/80 rounded-lg text-amber-200 text-xs flex items-start justify-between gap-3 shadow-sm">
+              <div className="flex items-start gap-2.5">
+                <Clock className="w-4 h-4 text-amber-400 shrink-0 mt-0.5 animate-pulse" />
+                <div>
+                  <strong className="font-semibold block text-amber-100 text-sm">Rate Limit Active (Directive 11)</strong>
+                  <p className="mt-1 leading-relaxed text-amber-200">
+                    Token bucket throttle engaged to protect Gemini quotas. You can retry in{' '}
+                    <span className="font-mono font-bold text-amber-300 text-xs bg-amber-900/60 px-1.5 py-0.5 rounded border border-amber-700/50">
+                      {rateLimitSeconds}s
+                    </span>{' '}
+                    {rateLimitTargetTime && `(available at ${rateLimitTargetTime})`}.
+                  </p>
+                  <p className="text-[11px] text-amber-400/80 mt-1.5 flex items-center gap-1 font-mono">
+                    <ShieldAlert className="w-3 h-3 text-amber-400" />
+                    <span>Your reflection draft is safely preserved below and will not be lost.</span>
+                  </p>
+                </div>
               </div>
+              <button
+                type="button"
+                onClick={handleSubmit}
+                disabled={rateLimitSeconds > 0 || isSubmitting}
+                className="px-3 py-1.5 bg-amber-900/80 hover:bg-amber-800 text-amber-100 disabled:opacity-40 disabled:cursor-not-allowed rounded-md font-medium text-xs flex items-center gap-1.5 shrink-0 border border-amber-700 transition-all cursor-pointer"
+              >
+                <RefreshCw className={`w-3 h-3 ${rateLimitSeconds > 0 ? '' : 'text-amber-300'}`} />
+                <span>{rateLimitSeconds > 0 ? `Wait ${rateLimitSeconds}s` : 'Retry Now'}</span>
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={handleSubmit}
-              className="px-2.5 py-1 bg-rose-700 hover:bg-rose-600 text-white rounded font-medium flex items-center gap-1 shrink-0"
-            >
-              <RefreshCw className="w-3 h-3" />
-              <span>Retry</span>
-            </button>
-          </div>
+          ) : (
+            <div className="mb-5 p-4 bg-rose-950/40 border border-rose-800 rounded-lg text-rose-300 text-xs flex items-start justify-between gap-3">
+              <div className="flex items-start gap-2">
+                <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <div>
+                  <strong className="font-semibold block text-rose-200">Reflection Submission Issue</strong>
+                  <p className="mt-0.5">{errorMessage}</p>
+                  <p className="text-[11px] text-rose-400 mt-1">Your reflection buffer is preserved below.</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleSubmit}
+                className="px-2.5 py-1 bg-rose-700 hover:bg-rose-600 text-white rounded font-medium flex items-center gap-1 shrink-0"
+              >
+                <RefreshCw className="w-3 h-3" />
+                <span>Retry</span>
+              </button>
+            </div>
+          )
         )}
 
         {/* Submission State Progress */}
@@ -281,13 +355,18 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
           <button
             id="btn-submit-reflection"
             type="submit"
-            disabled={isSubmitting || !content.trim()}
+            disabled={isSubmitting || !content.trim() || (rateLimitSeconds !== null && rateLimitSeconds > 0)}
             className="inline-flex items-center gap-2 bg-white hover:bg-gray-200 active:bg-gray-300 text-black font-semibold px-5 py-2.5 rounded-lg text-sm shadow-md transition-all disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
           >
             {isSubmitting ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin text-black" />
                 <span>Processing...</span>
+              </>
+            ) : rateLimitSeconds !== null && rateLimitSeconds > 0 ? (
+              <>
+                <Clock className="w-4 h-4 text-black animate-pulse" />
+                <span>Rate Limited ({rateLimitSeconds}s)</span>
               </>
             ) : (
               <>
@@ -298,6 +377,22 @@ export const JournalEditor: React.FC<JournalEditorProps> = ({
           </button>
         </div>
       </form>
+
+      {/* Resilient Retry Toast (Directive 6: Never clears user input buffer on failed write) */}
+      <RetryToast
+        isOpen={isToastOpen}
+        title="Reflection Save Failed"
+        errorMessage={errorMessage || 'Failed to process financial reflection.'}
+        bufferCharacterCount={content.length}
+        rateLimitSeconds={rateLimitSeconds}
+        rateLimitTargetTime={rateLimitTargetTime}
+        isRetrying={isSubmitting}
+        onRetry={() => {
+          const fakeEvent = { preventDefault: () => {} } as React.FormEvent;
+          handleSubmit(fakeEvent);
+        }}
+        onDismiss={() => setIsToastOpen(false)}
+      />
     </div>
   );
 };

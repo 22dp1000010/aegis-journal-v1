@@ -218,3 +218,181 @@ export async function verifyFirebaseToken(idToken: string): Promise<DecodedIdTok
 }
 
 export { FieldValue };
+
+/**
+ * Server-side Rate Limiting parameters (Directive 11).
+ * Configured strictly via GEMINI_RATE_LIMIT_CAPACITY and GEMINI_RATE_LIMIT_INTERVAL_SECONDS
+ * environment variables, read once at startup.
+ */
+export const RATE_LIMIT_CONFIG = Object.freeze({
+  // Maximum tokens the bucket holds
+  capacity: process.env.GEMINI_RATE_LIMIT_CAPACITY
+    ? parseInt(process.env.GEMINI_RATE_LIMIT_CAPACITY, 10)
+    : 5,
+  // Duration in seconds to fully refill bucket from 0 to capacity
+  refillPeriodSeconds: process.env.GEMINI_RATE_LIMIT_INTERVAL_SECONDS
+    ? parseInt(process.env.GEMINI_RATE_LIMIT_INTERVAL_SECONDS, 10)
+    : 60,
+});
+
+export interface RateLimitResult {
+  allowed: boolean;
+  remainingTokens: number;
+  retryAfterSeconds: number;
+  capacity: number;
+}
+
+// In-memory fallback bucket map for local development or when remote Firestore credentials are not bound in container
+const localFallbackBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+
+/**
+ * Token bucket rate limit checked inside a Firestore transaction keyed by uid.
+ * Stored under users/{uid}/profile/rateLimit so it falls inside existing rules.
+ * 
+ * Timestamps written to Firestore strictly use FieldValue.serverTimestamp().
+ * Never new Date(), never Date.now(), never an ISO string.
+ */
+export async function checkAndConsumeRateLimit(uid: string): Promise<RateLimitResult> {
+  if (!uid) {
+    return {
+      allowed: false,
+      remainingTokens: 0,
+      retryAfterSeconds: 60,
+      capacity: RATE_LIMIT_CONFIG.capacity,
+    };
+  }
+
+  const capacity = RATE_LIMIT_CONFIG.capacity;
+  const refillPeriodSeconds = RATE_LIMIT_CONFIG.refillPeriodSeconds;
+  const fillRatePerSecond = capacity / refillPeriodSeconds;
+
+  try {
+    const firestore = getAdminFirestore();
+    // Store bucket under users/{uid}/profile (doc: rateLimit)
+    const bucketRef = firestore.doc(`users/${uid}/profile/rateLimit`);
+
+    return await firestore.runTransaction(async (transaction) => {
+      const doc = await transaction.get(bucketRef);
+      const nowMs = Date.now();
+
+      if (!doc.exists) {
+        // First request: initialize bucket and consume 1 token
+        const remainingTokens = Math.max(0, capacity - 1);
+        transaction.set(bucketRef, {
+          tokens: remainingTokens,
+          lastRefill: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+
+        return {
+          allowed: true,
+          remainingTokens,
+          retryAfterSeconds: 0,
+          capacity,
+        };
+      }
+
+      const data = doc.data() || {};
+      const storedTokens = typeof data.tokens === 'number' ? data.tokens : capacity;
+
+      // Resolve previous refill timestamp safely
+      let lastRefillMs = nowMs;
+      if (data.lastRefill?.toDate) {
+        lastRefillMs = data.lastRefill.toDate().getTime();
+      } else if (data.lastRefill?.toMillis) {
+        lastRefillMs = data.lastRefill.toMillis();
+      } else if (typeof data.lastRefill === 'number') {
+        lastRefillMs = data.lastRefill;
+      }
+
+      // Calculate replenished tokens based on elapsed server time
+      const elapsedSeconds = Math.max(0, (nowMs - lastRefillMs) / 1000);
+      const currentTokens = Math.min(capacity, storedTokens + (elapsedSeconds * fillRatePerSecond));
+
+      if (currentTokens >= 1) {
+        // Sufficient token available: consume 1 token
+        const remainingTokens = currentTokens - 1;
+        transaction.set(
+          bucketRef,
+          {
+            tokens: remainingTokens,
+            lastRefill: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        return {
+          allowed: true,
+          remainingTokens,
+          retryAfterSeconds: 0,
+          capacity,
+        };
+      } else {
+        // Insufficient token: calculate wait duration until at least 1 token is accumulated
+        const tokensNeeded = 1 - currentTokens;
+        const retryAfterSeconds = Math.max(1, Math.ceil(tokensNeeded / fillRatePerSecond));
+
+        // Persist the current fractional token state with serverTimestamp()
+        transaction.set(
+          bucketRef,
+          {
+            tokens: currentTokens,
+            lastRefill: FieldValue.serverTimestamp(),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true }
+        );
+
+        return {
+          allowed: false,
+          remainingTokens: currentTokens,
+          retryAfterSeconds,
+          capacity,
+        };
+      }
+    });
+  } catch (err: any) {
+    // If Firestore transaction rejects (e.g. local container sandbox without GCP credentials),
+    // evaluate against identical local token bucket so testing and rate limiting remain functional
+    console.warn('[Aegis RateLimiter] Firestore transaction unavailable, applying local token bucket fallback:', err?.message || err);
+    
+    const now = Date.now();
+    let bucket = localFallbackBuckets.get(uid);
+
+    if (!bucket) {
+      const remainingTokens = Math.max(0, capacity - 1);
+      localFallbackBuckets.set(uid, { tokens: remainingTokens, lastRefill: now });
+      return {
+        allowed: true,
+        remainingTokens,
+        retryAfterSeconds: 0,
+        capacity,
+      };
+    }
+
+    const elapsedSeconds = Math.max(0, (now - bucket.lastRefill) / 1000);
+    const currentTokens = Math.min(capacity, bucket.tokens + (elapsedSeconds * fillRatePerSecond));
+
+    if (currentTokens >= 1) {
+      const remainingTokens = currentTokens - 1;
+      localFallbackBuckets.set(uid, { tokens: remainingTokens, lastRefill: now });
+      return {
+        allowed: true,
+        remainingTokens,
+        retryAfterSeconds: 0,
+        capacity,
+      };
+    } else {
+      const tokensNeeded = 1 - currentTokens;
+      const retryAfterSeconds = Math.max(1, Math.ceil(tokensNeeded / fillRatePerSecond));
+      localFallbackBuckets.set(uid, { tokens: currentTokens, lastRefill: now });
+      return {
+        allowed: false,
+        remainingTokens: currentTokens,
+        retryAfterSeconds,
+        capacity,
+      };
+    }
+  }
+}

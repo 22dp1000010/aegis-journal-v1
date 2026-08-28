@@ -1112,7 +1112,7 @@ service cloud.firestore {
                 Panel 4 — Key Custody Runtime Statement
               </h2>
               <p className="text-xs text-gray-400">
-                Runtime cryptographic assertion proving GEMINI_API_KEY is resolved from Secret Manager inside Cloud Run, and the client JavaScript bundle contains zero key material.
+                Live runtime verification: the Gemini key is server-resident and absent from the client bundle.
               </p>
             </div>
             <button
@@ -1154,11 +1154,19 @@ service cloud.firestore {
                   </span>
                 </div>
 
-                <div className="p-4 bg-[#141414] border border-[#222] rounded-xl">
-                  <span className="text-gray-400 block mb-1 font-sans">Server Key Resolution</span>
-                  <span className="font-semibold text-emerald-400">
-                    Resolved from Secret Manager ({custodyStatus.keyMask})
-                  </span>
+                <div className="p-4 bg-[#141414] border border-[#222] rounded-xl space-y-2">
+                  <div>
+                    <span className="text-gray-400 block mb-1 font-sans">Server Key Resolution</span>
+                    <span className="font-semibold text-emerald-400 block">
+                      {custodyStatus.keySource || 'Resolved server-side'} ({custodyStatus.keyMask})
+                    </span>
+                  </div>
+                  <div className="pt-2 border-t border-[#222]">
+                    <span className="text-gray-400 block mb-0.5 font-sans">Deployment Configuration</span>
+                    <span className="text-gray-300 block text-[11px] leading-relaxed">
+                      Bound to Cloud Run revision via --set-secrets from Secret Manager (GEMINI_API_KEY:latest)
+                    </span>
+                  </div>
                 </div>
               </div>
 

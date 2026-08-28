@@ -13,6 +13,7 @@ import { EntryDetailView } from './components/EntryDetailView';
 import { TrustCenter } from './components/TrustCenter';
 import { ActivityView } from './components/ActivityView';
 import { AliasManagerModal } from './components/AliasManagerModal';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { JournalEntry } from './types';
 import { Loader2 } from 'lucide-react';
 
@@ -107,8 +108,10 @@ const MainContent: React.FC = () => {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <MainContent />
-    </AuthProvider>
+    <ErrorBoundary>
+      <AuthProvider>
+        <MainContent />
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }
