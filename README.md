@@ -204,3 +204,10 @@ gcloud run services update aegis-journal \
 - **Step 3**: Under "2. Isolation Self-Test", click "Execute Live Foreign Tenant Read". Confirm verbatim `permission-denied` rejection from Firestore.
 - **Step 4**: Under "3. Prompt-Injection Neutralizer", click "Launch Adversarial Injection Attack". Confirm model neutralizes system prompt override attempt.
 - **Step 5**: Under "4. Key Custody Statement", verify 0 client key leakage assertion.
+
+
+## 7. Deployed Project URL 
+
+Deployed URL for the Aegis Journal Application:
+ https://aegis-journal-v1.ai.studio
+
