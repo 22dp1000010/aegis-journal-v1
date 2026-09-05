@@ -206,7 +206,110 @@ gcloud run services update aegis-journal \
 - **Step 5**: Under "4. Key Custody Statement", verify 0 client key leakage assertion.
 
 
-## 7. Deployed Project URL 
+## 7. Firestore Security Rules
+
+Access control is enforced in [`firestore.rules`](./firestore.rules), deployed to the
+`aegis-journal-dbid` database. That file is the canonical copy of the deployed
+ruleset; it is reproduced below for convenience.
+
+Three properties worth reading for:
+
+- **No admin clause on `entries` — the omission is the feature.** Administrators have
+  no rules path to entry content; they read only pre-aggregated metrics.
+  Demonstrated live in Trust Center panel 6.
+- **History is append-only.** `messages` and `auditLogs` deny `update` and `delete`
+  unconditionally, even to the owner. Demonstrated live in panel 5.
+- **Deny-by-default.** Any path not explicitly matched is rejected.
+
+Rules are edited by hand in the Firestore console and mirrored here — they are
+deliberately excluded from AI-assisted code generation.
+
+<details>
+<summary><b>Full ruleset</b> (click to expand)</summary>
+
+```javascript
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    function isAdmin() {
+      return isAuthenticated() && request.auth.token.role == 'admin';
+    }
+    function grantPath(userId, entryId) {
+      return /databases/$(database)/documents/users/$(userId)/entries/$(entryId)/grants/$(request.auth.uid);
+    }
+    function hasLiveGrant(userId, entryId) {
+      return isAuthenticated()
+        && exists(grantPath(userId, entryId))
+        && get(grantPath(userId, entryId)).data.revoked == false
+        && (
+          !('expiresAt' in get(grantPath(userId, entryId)).data)
+          || get(grantPath(userId, entryId)).data.expiresAt > request.time
+        );
+    }
+
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+
+      // Profile and user-declared aliases.
+      match /profile/{docId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      // NOTE: no admin clause on entries, by design. Directive 17 forbids
+      // granting administrators read access to entry content.
+      match /entries/{entryId} {
+        allow read:  if isOwner(userId) || hasLiveGrant(userId, entryId);
+        allow write: if isOwner(userId);
+
+        // Immutable conversation history.
+        match /messages/{messageId} {
+          allow read:   if isOwner(userId) || hasLiveGrant(userId, entryId);
+          allow create: if isOwner(userId);
+          allow update, delete: if false;
+        }
+
+        // Owner manages grants; grantee may read only their own.
+        match /grants/{granteeUid} {
+          allow read:   if isOwner(userId) || (isAuthenticated() && request.auth.uid == granteeUid);
+          allow create, update: if isOwner(userId);
+          allow delete: if false;   // revoke via field update, never delete
+        }
+      }
+
+      // Append-only audit log. Immutability enforced here; timestamps assigned
+      // server-side via serverTimestamp() in the write path.
+      match /auditLogs/{logId} {
+        allow read: if isOwner(userId) || isAdmin();
+        allow create: if isOwner(userId)
+          && request.resource.data.keys().hasAll(['action', 'ts']);
+        allow update, delete: if false;
+      }
+    }
+
+    // Pre-aggregated metrics. Counts only, written server-side. Admin-readable.
+    match /metrics/{docId} {
+      allow read:  if isAdmin();
+      allow write: if false;
+    }
+
+    // Explicit deny-by-default for any unmatched path.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+```
+
+</details>
+
+## 8. Deployed Project URL 
 
 Deployed URL for the Aegis Journal Application:
  https://aegis-journal-v1.ai.studio
